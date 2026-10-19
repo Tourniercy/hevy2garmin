@@ -152,6 +152,55 @@ async function currentEpoch(origin: string): Promise<number> {
   return epochCache.n;
 }
 
+/* --- Cloudflare Access (self-hosted behind CF Access) — inlined like everything
+   else in this file (the proxy bundler rejects cross-module imports).
+   When H2G_CF_ACCESS_TEAM (https://<team>.cloudflareaccess.com) and H2G_CF_ACCESS_AUD
+   are set, a request whose Cf-Access-Jwt-Assertion verifies against the team JWKS
+   (RS256, matching aud, unexpired) is granted the dashboard without the shared
+   password. Requests without a verifiable header (direct origin hits) keep the
+   #550 unconfigured refusal, and /api/cron keeps its own bearer check (#473). */
+let cfJwks: { keys: JsonWebKey[]; at: number } | null = null;
+const CF_JWKS_TTL_MS = 60 * 60 * 1000;
+
+function cfB64UrlToBytes(s: string): Uint8Array<ArrayBuffer> {
+  const b64 = s.replace(/-/g, "+").replace(/_/g, "/");
+  const bin = atob(b64 + "=".repeat((4 - (b64.length % 4)) % 4));
+  const bytes = new Uint8Array(new ArrayBuffer(bin.length));
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+
+async function cfAccessTrusted(req: NextRequest): Promise<boolean> {
+  const team = process.env.H2G_CF_ACCESS_TEAM;
+  const aud = process.env.H2G_CF_ACCESS_AUD;
+  if (!team || !aud) return false;
+  const token = req.headers.get("cf-access-jwt-assertion");
+  if (!token) return false;
+  const parts = token.split(".");
+  if (parts.length !== 3) return false;
+  try {
+    const header = JSON.parse(new TextDecoder().decode(cfB64UrlToBytes(parts[0]))) as { alg?: string; kid?: string };
+    const payload = JSON.parse(new TextDecoder().decode(cfB64UrlToBytes(parts[1]))) as { aud?: string | string[]; exp?: number };
+    if (header.alg !== "RS256" || !header.kid) return false;
+    const auds = Array.isArray(payload.aud) ? payload.aud : payload.aud ? [payload.aud] : [];
+    if (!auds.includes(aud)) return false;
+    const now = Math.floor(Date.now() / 1000);
+    if (typeof payload.exp !== "number" || payload.exp < now - 300) return false;
+    if (!cfJwks || Date.now() - cfJwks.at > CF_JWKS_TTL_MS) {
+      const res = await fetch(`${team.replace(/\/+$/, "")}/cdn-cgi/access/certs`, { cache: "no-store" });
+      if (!res.ok) return false;
+      const data = (await res.json()) as { keys?: JsonWebKey[] };
+      cfJwks = { keys: Array.isArray(data.keys) ? data.keys : [], at: Date.now() };
+    }
+    const jwk = cfJwks.keys.find((k) => (k as { kid?: string }).kid === header.kid);
+    if (!jwk) return false;
+    const key = await crypto.subtle.importKey("jwk", jwk, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["verify"]);
+    return await crypto.subtle.verify("RSASSA-PKCS1-v1_5", key, cfB64UrlToBytes(parts[2]), new TextEncoder().encode(`${parts[0]}.${parts[1]}`));
+  } catch {
+    return false;
+  }
+}
+
 // /api/cron/* carries a bearer (Vercel Cron, the generated GitHub Actions workflow) and no
 // session cookie; each cron route checks CRON_SECRET itself. Gating it here 401'd every
 // scheduled sync before that check ran (#473).
@@ -204,6 +253,10 @@ export async function proxy(req: NextRequest, event?: NextFetchEvent) {
     return demoRefusal();
   }
   if (!authEnabled()) {
+    // Cloudflare Access first: a verified edge JWT is the self-hosted replacement
+    // for the shared password (unset H2G_PASSWORD/HEVY2GARMIN_SECRET + set the two
+    // H2G_CF_ACCESS_* vars to run passwordless behind Access).
+    if (await cfAccessTrusted(req)) return NextResponse.next();
     if (!productionRuntime()) return NextResponse.next();
     if (UNCONFIGURED_PATHS.some((p) => pathname === p || pathname.startsWith(`${p}/`))) {
       return NextResponse.next();
