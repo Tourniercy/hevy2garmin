@@ -171,37 +171,32 @@ function cfB64UrlToBytes(s: string): Uint8Array<ArrayBuffer> {
 }
 
 async function cfAccessTrusted(req: NextRequest): Promise<boolean> {
-  const dbg = (m: string) => console.log("[cf-access]", m);
   const team = process.env.H2G_CF_ACCESS_TEAM;
   const aud = process.env.H2G_CF_ACCESS_AUD;
-  if (!team || !aud) { dbg("env missing"); return false; }
+  if (!team || !aud) return false;
   const token = req.headers.get("cf-access-jwt-assertion");
-  if (!token) { dbg("no jwt header"); return false; }
+  if (!token) return false;
   const parts = token.split(".");
-  if (parts.length !== 3) { dbg("bad token shape"); return false; }
+  if (parts.length !== 3) return false;
   try {
     const header = JSON.parse(new TextDecoder().decode(cfB64UrlToBytes(parts[0]))) as { alg?: string; kid?: string };
     const payload = JSON.parse(new TextDecoder().decode(cfB64UrlToBytes(parts[1]))) as { aud?: string | string[]; exp?: number };
-    if (header.alg !== "RS256" || !header.kid) { dbg(`alg/kid: ${header.alg}/${header.kid ?? "none"}`); return false; }
+    if (header.alg !== "RS256" || !header.kid) return false;
     const auds = Array.isArray(payload.aud) ? payload.aud : payload.aud ? [payload.aud] : [];
-    if (!auds.includes(aud)) { dbg(`aud mismatch: got ${JSON.stringify(auds).slice(0, 120)}`); return false; }
+    if (!auds.includes(aud)) return false;
     const now = Math.floor(Date.now() / 1000);
-    if (typeof payload.exp !== "number" || payload.exp < now - 300) { dbg(`exp ${payload.exp} vs now ${now}`); return false; }
+    if (typeof payload.exp !== "number" || payload.exp < now - 300) return false;
     if (!cfJwks || Date.now() - cfJwks.at > CF_JWKS_TTL_MS) {
       const res = await fetch(`${team.replace(/\/+$/, "")}/cdn-cgi/access/certs`, { cache: "no-store" });
-      if (!res.ok) { dbg(`jwks fetch ${res.status}`); return false; }
+      if (!res.ok) return false;
       const data = (await res.json()) as { keys?: JsonWebKey[] };
       cfJwks = { keys: Array.isArray(data.keys) ? data.keys : [], at: Date.now() };
     }
-    dbg(`jwks ${cfJwks.keys.length} keys, token kid ${header.kid}`);
     const jwk = cfJwks.keys.find((k) => (k as { kid?: string }).kid === header.kid);
-    if (!jwk) { dbg("kid not in jwks"); return false; }
+    if (!jwk) return false;
     const key = await crypto.subtle.importKey("jwk", jwk, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["verify"]);
-    const ok = await crypto.subtle.verify("RSASSA-PKCS1-v1_5", key, cfB64UrlToBytes(parts[2]), new TextEncoder().encode(`${parts[0]}.${parts[1]}`));
-    dbg(ok ? "signature OK" : "signature INVALID");
-    return ok;
-  } catch (e) {
-    dbg(`exception: ${String(e).slice(0, 150)}`);
+    return await crypto.subtle.verify("RSASSA-PKCS1-v1_5", key, cfB64UrlToBytes(parts[2]), new TextEncoder().encode(`${parts[0]}.${parts[1]}`));
+  } catch {
     return false;
   }
 }
