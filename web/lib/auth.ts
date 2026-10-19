@@ -173,3 +173,57 @@ export async function verifyPassword(candidate: string): Promise<boolean> {
   }
   return checkPassword(candidate);
 }
+
+
+/* --- Cloudflare Access (self-hosted behind CF Access).
+   When H2G_CF_ACCESS_TEAM (https://<team>.cloudflareaccess.com) and H2G_CF_ACCESS_AUD
+   are set, a request whose Cf-Access-Jwt-Assertion verifies against the team JWKS
+   (RS256, matching aud, unexpired) counts as authenticated for the #550 unconfigured
+   page gate. proxy.ts keeps its own inlined copy (the proxy bundler rejects
+   cross-module imports); this copy serves server components (the setup page). */
+export function cfAccessConfigured(): boolean {
+  return Boolean(process.env.H2G_CF_ACCESS_TEAM && process.env.H2G_CF_ACCESS_AUD);
+}
+
+function cfB64UrlToBytes(s: string): Uint8Array<ArrayBuffer> {
+  const b64 = s.replace(/-/g, "+").replace(/_/g, "/");
+  const bin = atob(b64 + "=".repeat((4 - (b64.length % 4)) % 4));
+  const bytes = new Uint8Array(new ArrayBuffer(bin.length));
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+
+async function cfVerifyAccessJwt(token: string): Promise<boolean> {
+  const team = process.env.H2G_CF_ACCESS_TEAM;
+  const aud = process.env.H2G_CF_ACCESS_AUD;
+  if (!team || !aud) return false;
+  const parts = token.split(".");
+  if (parts.length !== 3) return false;
+  try {
+    const header = JSON.parse(new TextDecoder().decode(cfB64UrlToBytes(parts[0]))) as { alg?: string; kid?: string };
+    const payload = JSON.parse(new TextDecoder().decode(cfB64UrlToBytes(parts[1]))) as { aud?: string | string[]; exp?: number };
+    if (header.alg !== "RS256" || !header.kid) return false;
+    const auds = Array.isArray(payload.aud) ? payload.aud : payload.aud ? [payload.aud] : [];
+    if (!auds.includes(aud)) return false;
+    const now = Math.floor(Date.now() / 1000);
+    if (typeof payload.exp !== "number" || payload.exp < now - 300) return false;
+    const res = await fetch(`${team.replace(/\/+$/, "")}/cdn-cgi/access/certs`, { cache: "no-store" });
+    if (!res.ok) return false;
+    const data = (await res.json()) as { keys?: JsonWebKey[] };
+    const jwk = (data.keys ?? []).find((k) => (k as { kid?: string }).kid === header.kid);
+    if (!jwk) return false;
+    const key = await crypto.subtle.importKey("jwk", jwk, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["verify"]);
+    return await crypto.subtle.verify("RSASSA-PKCS1-v1_5", key, cfB64UrlToBytes(parts[2]), new TextEncoder().encode(`${parts[0]}.${parts[1]}`));
+  } catch {
+    return false;
+  }
+}
+
+/** True when the CURRENT server request passed Cloudflare Access (server components only). */
+export async function cfAccessVerifiedFromHeaders(): Promise<boolean> {
+  if (!cfAccessConfigured()) return false;
+  const { headers } = await import("next/headers");
+  const token = (await headers()).get("cf-access-jwt-assertion");
+  if (!token) return false;
+  return cfVerifyAccessJwt(token);
+}

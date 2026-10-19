@@ -1,5 +1,5 @@
 import { getDb } from "@/lib/db";
-import { authEnabled, productionRuntime } from "@/lib/auth";
+import { authEnabled, productionRuntime, cfAccessVerifiedFromHeaders } from "@/lib/auth";
 import { loadGarminConnection, loadHevyConnection, type Connection } from "@/lib/connections";
 import { ConnectHevy } from "@/components/connect-hevy";
 import { ConnectGarmin } from "@/components/connect-garmin";
@@ -116,7 +116,8 @@ function SetPasswordFirst() {
 }
 
 export default async function SetupPage() {
-  if (productionRuntime() && !authEnabled()) return <SetPasswordFirst />;
+  // Behind Cloudflare Access (verified edge JWT) there is no password by design — continue.
+  if (productionRuntime() && !authEnabled() && !(await cfAccessVerifiedFromHeaders())) return <SetPasswordFirst />;
   const data = await loadSetup();
   const hevyConnected = data.hevy.connected;
   const garminConnected = data.garmin.connected;
