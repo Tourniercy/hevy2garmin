@@ -8,13 +8,13 @@
 # the `hevy2garmin` engine is the published npm release the lockfile pins, not
 # the typescript/ folder of this checkout.
 
-FROM node:26.13.0-bookworm-slim AS deps
+FROM node:26.13.1-alpine AS deps
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --no-audit --no-fund
 
 
-FROM node:26.13.0-bookworm-slim AS builder
+FROM node:26.13.1-alpine AS builder
 WORKDIR /app
 ENV NEXT_TELEMETRY_DISABLED=1
 COPY --from=deps /app/node_modules ./node_modules
@@ -28,7 +28,7 @@ ARG H2G_BASE_PATH=""
 RUN H2G_BASE_PATH="$H2G_BASE_PATH" DATABASE_URL=postgres://build:build@localhost:5432/build npm run build
 
 
-FROM node:26.13.0-bookworm-slim
+FROM node:26.13.1-alpine
 
 # Kept at runtime for the health check, which has to call the prefixed path.
 ARG H2G_BASE_PATH=""
